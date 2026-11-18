@@ -36,6 +36,7 @@ jobs:
           bash part1.sh
           bash part1b.sh
           bash part2.sh
+          bash part3.sh
 
       - name: Process App Logo and Launcher Icons
         run: |
