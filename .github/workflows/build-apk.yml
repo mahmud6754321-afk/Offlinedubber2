@@ -39,32 +39,37 @@ jobs:
 
       - name: Process App Logo and Launcher Icons
         run: |
-          command -v ffmpeg >/dev/null || (sudo apt-get update && sudo apt-get install -y ffmpeg)
-          LOGO_FILE=$(find . -maxdepth 1 -type f \( -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.webp" \) | head -n 1)
-          mkdir -p app/src/main/res/drawable
-          mkdir -p app/src/main/res/mipmap-mdpi app/src/main/res/mipmap-hdpi app/src/main/res/mipmap-xhdpi app/src/main/res/mipmap-xxhdpi app/src/main/res/mipmap-xxxhdpi
-          if [ -n "$LOGO_FILE" ]; then
-            echo "Using uploaded logo: $LOGO_FILE"
-            ffmpeg -y -i "$LOGO_FILE" -vf "scale=512:512:force_original_aspect_ratio=increase,crop=512:512" app/src/main/res/drawable/app_logo.png
-            ffmpeg -y -i "$LOGO_FILE" -vf "scale=48:48:force_original_aspect_ratio=increase,crop=48:48" app/src/main/res/mipmap-mdpi/ic_launcher.png
-            ffmpeg -y -i "$LOGO_FILE" -vf "scale=72:72:force_original_aspect_ratio=increase,crop=72:72" app/src/main/res/mipmap-hdpi/ic_launcher.png
-            ffmpeg -y -i "$LOGO_FILE" -vf "scale=96:96:force_original_aspect_ratio=increase,crop=96:96" app/src/main/res/mipmap-xhdpi/ic_launcher.png
-            ffmpeg -y -i "$LOGO_FILE" -vf "scale=144:144:force_original_aspect_ratio=increase,crop=144:144" app/src/main/res/mipmap-xxhdpi/ic_launcher.png
-            ffmpeg -y -i "$LOGO_FILE" -vf "scale=192:192:force_original_aspect_ratio=increase,crop=192:192" app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
-          else
-            echo "No logo image found, using fallback"
-            ffmpeg -y -f lavfi -i color=c=black:s=512x512 -frames:v 1 app/src/main/res/drawable/app_logo.png
-            ffmpeg -y -f lavfi -i color=c=black:s=48x48 -frames:v 1 app/src/main/res/mipmap-mdpi/ic_launcher.png
-            ffmpeg -y -f lavfi -i color=c=black:s=72x72 -frames:v 1 app/src/main/res/mipmap-hdpi/ic_launcher.png
-            ffmpeg -y -f lavfi -i color=c=black:s=96x96 -frames:v 1 app/src/main/res/mipmap-xhdpi/ic_launcher.png
-            ffmpeg -y -f lavfi -i color=c=black:s=144x144 -frames:v 1 app/src/main/res/mipmap-xxhdpi/ic_launcher.png
-            ffmpeg -y -f lavfi -i color=c=black:s=192x192 -frames:v 1 app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
-          fi
-          cp app/src/main/res/mipmap-mdpi/ic_launcher.png app/src/main/res/mipmap-mdpi/ic_launcher_round.png
-          cp app/src/main/res/mipmap-hdpi/ic_launcher.png app/src/main/res/mipmap-hdpi/ic_launcher_round.png
-          cp app/src/main/res/mipmap-xhdpi/ic_launcher.png app/src/main/res/mipmap-xhdpi/ic_launcher_round.png
-          cp app/src/main/res/mipmap-xxhdpi/ic_launcher.png app/src/main/res/mipmap-xxhdpi/ic_launcher_round.png
-          cp app/src/main/res/mipmap-xxxhdpi/ic_launcher.png app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.png
+          python3 -m venv /tmp/pil
+          /tmp/pil/bin/pip install -q pillow
+          /tmp/pil/bin/python - << 'PYEOF'
+          import glob, os
+          from PIL import Image
+
+          files = []
+          for pat in ("*.png", "*.jpg", "*.jpeg", "*.webp", "*.PNG", "*.JPG", "*.JPEG", "*.WEBP"):
+              files.extend(glob.glob(pat))
+
+          if files:
+              print("Using uploaded logo:", files[0])
+              img = Image.open(files[0]).convert("RGBA")
+          else:
+              print("No logo image found, using fallback")
+              img = Image.new("RGBA", (512, 512), (0, 0, 0, 255))
+
+          w, h = img.size
+          side = min(w, h)
+          img = img.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
+
+          os.makedirs("app/src/main/res/drawable", exist_ok=True)
+          img.resize((512, 512), Image.LANCZOS).save("app/src/main/res/drawable/app_logo.png")
+
+          for d, sz in [("mdpi", 48), ("hdpi", 72), ("xhdpi", 96), ("xxhdpi", 144), ("xxxhdpi", 192)]:
+              folder = f"app/src/main/res/mipmap-{d}"
+              os.makedirs(folder, exist_ok=True)
+              resized = img.resize((sz, sz), Image.LANCZOS)
+              resized.save(f"{folder}/ic_launcher.png")
+              resized.save(f"{folder}/ic_launcher_round.png")
+          PYEOF
 
       - name: Download Whisper Base & Silero VAD Models
         run: |
