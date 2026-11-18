@@ -112,7 +112,7 @@ cat << 'EOF' > app/src/main/AndroidManifest.xml
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
-        android:label="VT ভিডিও অনুবাদ"
+        android:label="VT ভিডিও ট্রান্সলেটর"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <activity
