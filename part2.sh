@@ -50,8 +50,8 @@ android {
         applicationId = "com.offline.videodubber"
         minSdk = 24
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 3
+        versionName = "3.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
@@ -110,7 +110,9 @@ cat << 'EOF' > app/src/main/AndroidManifest.xml
 
     <application
         android:allowBackup="true"
-        android:label="অফলাইন ভিডিও ডাবিং"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="VT ভিডিও অনুবাদ"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <activity
@@ -137,13 +139,19 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.launch
@@ -176,6 +184,8 @@ fun DubberScreen(engine: OfflineDubberEngine) {
     val scope = rememberCoroutineScope()
 
     var selectedVideoUri by remember { mutableStateOf<Uri?>(null) }
+    var sourceLang by remember { mutableStateOf(SourceLanguage.AUTO) }
+    var showSourceMenu by remember { mutableStateOf(false) }
     var selectedLang by remember { mutableStateOf(TargetLanguage.BENGALI) }
     var isProcessing by remember { mutableStateOf(false) }
     var progress by remember { mutableFloatStateOf(0f) }
@@ -191,7 +201,7 @@ fun DubberScreen(engine: OfflineDubberEngine) {
         if (uri != null) {
             selectedVideoUri = uri
             result = null
-            statusText = "ভিডিও নির্বাচিত হয়েছে। এবার রূপান্তর শুরু করুন।"
+            statusText = "ভিডিও নির্বাচিত হয়েছে। এবার ভাষা বেছে নিয়ে রূপান্তর শুরু করুন।"
         }
     }
 
@@ -218,19 +228,19 @@ fun DubberScreen(engine: OfflineDubberEngine) {
 
     fun playSynced(videoUri: Uri, audioFile: File) {
         stopPlayback()
+        val player = MediaPlayer().apply {
+            setDataSource(audioFile.absolutePath)
+            prepare()
+        }
+        mediaPlayerRef = player
         videoViewRef?.apply {
             setVideoURI(videoUri)
             setOnPreparedListener { mp ->
                 mp.setVolume(0f, 0f)
                 start()
+                player.start()
             }
         }
-        val player = MediaPlayer().apply {
-            setDataSource(audioFile.absolutePath)
-            prepare()
-            start()
-        }
-        mediaPlayerRef = player
     }
 
     Column(
@@ -240,14 +250,30 @@ fun DubberScreen(engine: OfflineDubberEngine) {
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text(
-            text = "অফলাইন AI ভিডিও ভাষা রূপান্তর",
-            style = MaterialTheme.typography.headlineSmall
-        )
-        Text(
-            text = "১০০% ফ্রি ও অফলাইন (প্রথমবার অনুবাদ ভাষা ~৩০ MB ডাউনলোড হবে)",
-            style = MaterialTheme.typography.bodySmall
-        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Image(
+                painter = painterResource(id = R.drawable.app_logo),
+                contentDescription = "VT Logo",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .size(64.dp)
+                    .clip(RoundedCornerShape(14.dp))
+            )
+            Column {
+                Text(
+                    text = "VT অফলাইন AI ডাবিং",
+                    style = MaterialTheme.typography.headlineSmall
+                )
+                Text(
+                    text = "১০০% ফ্রি ও অফলাইন (Whisper Base + VAD)",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        }
 
         Button(
             onClick = { pickVideoLauncher.launch(arrayOf("video/*")) },
@@ -257,7 +283,31 @@ fun DubberScreen(engine: OfflineDubberEngine) {
             Text(if (selectedVideoUri == null) "১. ভিডিও সিলেক্ট করুন" else "অন্য ভিডিও সিলেক্ট করুন")
         }
 
-        Text("২. কোন ভাষায় শুনতে চান?", style = MaterialTheme.typography.titleMedium)
+        Text("২. ভিডিওতে কোন ভাষায় কথা বলা হচ্ছে?", style = MaterialTheme.typography.titleMedium)
+        Box(modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(
+                onClick = { if (!isProcessing) showSourceMenu = true },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("ভিডিওর ভাষা: ${sourceLang.label}")
+            }
+            DropdownMenu(
+                expanded = showSourceMenu,
+                onDismissRequest = { showSourceMenu = false }
+            ) {
+                SourceLanguage.entries.forEach { src ->
+                    DropdownMenuItem(
+                        text = { Text(src.label) },
+                        onClick = {
+                            sourceLang = src
+                            showSourceMenu = false
+                        }
+                    )
+                }
+            }
+        }
+
+        Text("৩. কোন ভাষায় শুনতে চান?", style = MaterialTheme.typography.titleMedium)
         Column {
             TargetLanguage.entries.forEach { lang ->
                 Row(
@@ -284,7 +334,7 @@ fun DubberScreen(engine: OfflineDubberEngine) {
                 progress = 0f
                 scope.launch {
                     try {
-                        val res = engine.processVideo(uri, selectedLang) { p, msg ->
+                        val res = engine.processVideo(uri, sourceLang, selectedLang) { p, msg ->
                             progress = p
                             statusText = msg
                         }
@@ -299,7 +349,7 @@ fun DubberScreen(engine: OfflineDubberEngine) {
             enabled = selectedVideoUri != null && !isProcessing,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text(if (isProcessing) "কাজ চলছে..." else "৩. অফলাইন রূপান্তর শুরু করুন")
+            Text(if (isProcessing) "কাজ চলছে..." else "৪. অফলাইন রূপান্তর শুরু করুন")
         }
 
         if (isProcessing) {
