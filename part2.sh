@@ -50,8 +50,8 @@ android {
         applicationId = "com.offline.videodubber"
         minSdk = 24
         targetSdk = 35
-        versionCode = 3
-        versionName = "3.0"
+        versionCode = 4
+        versionName = "4.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
@@ -133,13 +133,17 @@ package com.offline.videodubber
 import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
+import android.view.Gravity
+import android.widget.FrameLayout
 import android.widget.Toast
 import android.widget.VideoView
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -149,6 +153,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
@@ -192,6 +197,10 @@ fun DubberScreen(engine: OfflineDubberEngine) {
     var statusText by remember { mutableStateOf("শুরু করতে একটি ভিডিও নির্বাচন করুন") }
     var result by remember { mutableStateOf<DubbingResult?>(null) }
 
+    var isFullScreen by remember { mutableStateOf(false) }
+    var pendingSeekMs by remember { mutableIntStateOf(0) }
+    var pendingAutoPlay by remember { mutableStateOf(false) }
+
     var videoViewRef by remember { mutableStateOf<VideoView?>(null) }
     var mediaPlayerRef by remember { mutableStateOf<MediaPlayer?>(null) }
 
@@ -201,6 +210,7 @@ fun DubberScreen(engine: OfflineDubberEngine) {
         if (uri != null) {
             selectedVideoUri = uri
             result = null
+            isFullScreen = false
             statusText = "ভিডিও নির্বাচিত হয়েছে। এবার ভাষা বেছে নিয়ে রূপান্তর শুরু করুন।"
         }
     }
@@ -226,21 +236,108 @@ fun DubberScreen(engine: OfflineDubberEngine) {
         }
     }
 
-    fun playSynced(videoUri: Uri, audioFile: File) {
-        stopPlayback()
-        val player = MediaPlayer().apply {
-            setDataSource(audioFile.absolutePath)
-            prepare()
-        }
-        mediaPlayerRef = player
-        videoViewRef?.apply {
-            setVideoURI(videoUri)
-            setOnPreparedListener { mp ->
-                mp.setVolume(0f, 0f)
-                start()
-                player.start()
+    fun attachVideo(vv: VideoView, videoUri: Uri, audioFile: File) {
+        vv.setVideoURI(videoUri)
+        vv.setOnPreparedListener { mp ->
+            mp.setVolume(0f, 0f)
+            val seekTarget = pendingSeekMs
+            val autoPlay = pendingAutoPlay
+            pendingSeekMs = 0
+            pendingAutoPlay = false
+            if (autoPlay) {
+                val player = MediaPlayer().apply {
+                    setDataSource(audioFile.absolutePath)
+                    prepare()
+                    if (seekTarget > 0 && seekTarget < duration) seekTo(seekTarget)
+                    start()
+                }
+                mediaPlayerRef = player
+                if (seekTarget > 0) vv.seekTo(seekTarget)
+                vv.start()
+            } else {
+                vv.seekTo(if (seekTarget > 0) seekTarget else 100)
             }
         }
+    }
+
+    fun playSynced(videoUri: Uri, audioFile: File) {
+        stopPlayback()
+        pendingSeekMs = 0
+        pendingAutoPlay = true
+        videoViewRef?.let { attachVideo(it, videoUri, audioFile) }
+    }
+
+    fun toggleFullScreen(enable: Boolean) {
+        val curPos = runCatching { videoViewRef?.currentPosition ?: 0 }.getOrDefault(0)
+        val wasPlaying = runCatching { mediaPlayerRef?.isPlaying == true }.getOrDefault(false)
+        stopPlayback()
+        pendingSeekMs = curPos
+        pendingAutoPlay = wasPlaying
+        isFullScreen = enable
+    }
+
+    BackHandler(enabled = isFullScreen) {
+        toggleFullScreen(false)
+    }
+
+    val currentResult = result
+    val currentVideo = selectedVideoUri
+
+    if (isFullScreen && currentResult != null && currentVideo != null) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black)
+        ) {
+            AndroidView(
+                factory = { ctx ->
+                    FrameLayout(ctx).apply {
+                        setBackgroundColor(android.graphics.Color.BLACK)
+                        val vv = VideoView(ctx).apply {
+                            layoutParams = FrameLayout.LayoutParams(
+                                FrameLayout.LayoutParams.MATCH_PARENT,
+                                FrameLayout.LayoutParams.MATCH_PARENT,
+                                Gravity.CENTER
+                            )
+                        }
+                        addView(vv)
+                        videoViewRef = vv
+                        attachVideo(vv, currentVideo, currentResult.dubbedAudioFile)
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+
+            Row(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .background(Color.Black.copy(alpha = 0.65f))
+                    .padding(12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = { playSynced(currentVideo, currentResult.dubbedAudioFile) },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("▶ শুনুন")
+                }
+                OutlinedButton(
+                    onClick = { stopPlayback() },
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("⏹ থামান")
+                }
+                Button(
+                    onClick = { toggleFullScreen(false) },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("✕ ছোট করুন")
+                }
+            }
+        }
+        return
     }
 
     Column(
@@ -357,19 +454,30 @@ fun DubberScreen(engine: OfflineDubberEngine) {
         }
         Text(text = statusText, style = MaterialTheme.typography.bodyMedium)
 
-        val currentResult = result
-        val currentVideo = selectedVideoUri
         if (currentResult != null && currentVideo != null) {
             HorizontalDivider()
             Text("ডাবিং সম্পন্ন!", style = MaterialTheme.typography.titleMedium)
 
             AndroidView(
                 factory = { ctx ->
-                    VideoView(ctx).also { videoViewRef = it }
+                    FrameLayout(ctx).apply {
+                        setBackgroundColor(android.graphics.Color.BLACK)
+                        val vv = VideoView(ctx).apply {
+                            layoutParams = FrameLayout.LayoutParams(
+                                FrameLayout.LayoutParams.MATCH_PARENT,
+                                FrameLayout.LayoutParams.MATCH_PARENT,
+                                Gravity.CENTER
+                            )
+                        }
+                        addView(vv)
+                        videoViewRef = vv
+                        attachVideo(vv, currentVideo, currentResult.dubbedAudioFile)
+                    }
                 },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(220.dp)
+                    .height(380.dp)
+                    .clip(RoundedCornerShape(12.dp))
             )
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -385,6 +493,13 @@ fun DubberScreen(engine: OfflineDubberEngine) {
                 ) {
                     Text("⏹ থামান")
                 }
+            }
+
+            Button(
+                onClick = { toggleFullScreen(true) },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("⛶ ফুল স্ক্রিন (বড় পর্দায় দেখুন)")
             }
 
             OutlinedButton(
