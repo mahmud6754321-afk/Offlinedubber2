@@ -1,4 +1,4 @@
-name: Build Offline Dubber APK
+name:  Video Translator APK
 
 on:
   workflow_dispatch:
