@@ -6,15 +6,14 @@ package com.offline.videodubber
 
 import android.content.Context
 import android.net.Uri
-import android.os.Bundle
 import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
 import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.common.model.RemoteModelManager
 import com.google.mlkit.nl.languageid.LanguageIdentification
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.TranslateRemoteModel
 import com.google.mlkit.nl.translate.Translation
+import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
 import com.k2fsa.sherpa.onnx.FeatureConfig
 import com.k2fsa.sherpa.onnx.OfflineModelConfig
@@ -25,18 +24,11 @@ import com.k2fsa.sherpa.onnx.SileroVadModelConfig
 import com.k2fsa.sherpa.onnx.Vad
 import com.k2fsa.sherpa.onnx.VadModelConfig
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.FileOutputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.Locale
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 enum class SourceLanguage(val label: String, val whisperCode: String, val mlKitCode: String?) {
   AUTO("স্বয়ংক্রিয় (Auto Detect)", "", null),
@@ -57,94 +49,118 @@ enum class TargetLanguage(val label: String, val mlKitCode: String, val locale: 
   ENGLISH("ইংরেজি (English)", TranslateLanguage.ENGLISH, Locale.US)
 }
 
-data class DubbingResult(
-  val dubbedAudioFile: File,
+data class DubbingResult(val dubbedAudioFile: File, val cues: List<SubtitleCue>, val headerInfo: String) {
   val transcriptText: String
-)
+    get() = buildString {
+      append(headerInfo).append("\n----------------------------------------\n")
+      cues.forEach { c -> append("[${c.startMs / 1000}s - ${c.endMs / 1000}s]\nমূল: ${c.orig}\nঅনুবাদ: ${c.trans}\n\n") }
+    }
+}
 
 class OfflineDubberEngine(private val context: Context) {
 
   private var recognizer: OfflineRecognizer? = null
   private var currentWhisperLang: String? = null
+  private var liveTranslator: Translator? = null
+  private var liveSrcCode: String? = null
+  private var liveTgtCode: String? = null
 
   private fun getRecognizer(whisperLang: String): OfflineRecognizer {
     val existing = recognizer
     if (existing != null && currentWhisperLang == whisperLang) return existing
     existing?.release()
-
     val config = OfflineRecognizerConfig(
       featConfig = FeatureConfig(sampleRate = 16000, featureDim = 80),
       modelConfig = OfflineModelConfig(
         whisper = OfflineWhisperModelConfig(
-          encoder = "whisper/base-encoder.int8.onnx",
-          decoder = "whisper/base-decoder.int8.onnx",
-          language = whisperLang,
-          task = "transcribe"
+          encoder = "whisper/base-encoder.int8.onnx", decoder = "whisper/base-decoder.int8.onnx",
+          language = whisperLang, task = "transcribe"
         ),
-        tokens = "whisper/base-tokens.txt",
-        numThreads = 4,
-        modelType = "whisper"
+        tokens = "whisper/base-tokens.txt", numThreads = 4, modelType = "whisper"
       )
     )
     return OfflineRecognizer(assetManager = context.assets, config = config).also {
-      recognizer = it
-      currentWhisperLang = whisperLang
+      recognizer = it; currentWhisperLang = whisperLang
     }
   }
 
-  private fun extractSpeechSegmentsWithVad(samples: FloatArray): List<Triple<Int, Int, FloatArray>> {
+  fun createLiveVad(): Vad {
     val vadConfig = VadModelConfig(
       sileroVadModelConfig = SileroVadModelConfig(
-        model = "whisper/silero_vad.onnx",
-        threshold = 0.45f,
-        minSilenceDuration = 0.40f,
-        minSpeechDuration = 0.25f,
-        windowSize = 512,
-        maxSpeechDuration = 12.0f
+        model = "whisper/silero_vad.onnx", threshold = 0.45f,
+        minSilenceDuration = 0.35f, minSpeechDuration = 0.25f, windowSize = 512, maxSpeechDuration = 6.0f
       ),
-      sampleRate = 16000,
-      numThreads = 1
+      sampleRate = 16000, numThreads = 1
     )
-    val vad = Vad(assetManager = context.assets, config = vadConfig)
+    return Vad(assetManager = context.assets, config = vadConfig)
+  }
+
+  suspend fun createTts(locale: Locale, forLiveAssistant: Boolean): Pair<TextToSpeech, Boolean> =
+    WavTtsHelper.createTts(context, locale, forLiveAssistant)
+
+  private suspend fun ensureModelsAndTranslate(text: String, srcCode: String, tgtCode: String): String {
+    if (srcCode == tgtCode) return text
+    if (liveTranslator == null || liveSrcCode != srcCode || liveTgtCode != tgtCode) {
+      liveTranslator?.close()
+      val tr = Translation.getClient(TranslatorOptions.Builder().setSourceLanguage(srcCode).setTargetLanguage(tgtCode).build())
+      val mgr = RemoteModelManager.getInstance()
+      val sReady = runCatching { mgr.isModelDownloaded(TranslateRemoteModel.Builder(srcCode).build()).await() }.getOrDefault(false)
+      val tReady = runCatching { mgr.isModelDownloaded(TranslateRemoteModel.Builder(tgtCode).build()).await() }.getOrDefault(false)
+      if (!sReady || !tReady) {
+        val ok = withTimeoutOrNull(90_000L) {
+          runCatching { tr.downloadModelIfNeeded(DownloadConditions.Builder().build()).await() }.isSuccess
+        } ?: false
+        if (!ok) { tr.close(); throw IllegalStateException("প্রথমবার এই ভাষার অনুবাদ প্যাক (~৩০ MB) নামাতে ইন্টারনেট চালু করুন।") }
+      }
+      liveTranslator = tr; liveSrcCode = srcCode; liveTgtCode = tgtCode
+    }
+    return liveTranslator!!.translate(text).await()
+  }
+
+  suspend fun transcribeAndTranslateLive(samples: FloatArray, sourceLang: SourceLanguage, targetLang: TargetLanguage): Pair<String, String>? =
+    withContext(Dispatchers.IO) {
+      val asr = getRecognizer(sourceLang.whisperCode)
+      val stream = asr.createStream()
+      stream.acceptWaveform(samples, 16000)
+      asr.decode(stream)
+      val raw = asr.getResult(stream).text.trim()
+      stream.release()
+      val cleaned = WavTtsHelper.cleanWhisperRepetitions(raw)
+      if (cleaned.isBlank() || cleaned.length < 2) return@withContext null
+      val srcCode = if (sourceLang.mlKitCode != null) sourceLang.mlKitCode else {
+        val det = runCatching { LanguageIdentification.getClient().identifyLanguage(cleaned).await() }.getOrDefault("en")
+        TranslateLanguage.fromLanguageTag(det) ?: TranslateLanguage.ENGLISH
+      }
+      Pair(cleaned, ensureModelsAndTranslate(cleaned, srcCode, targetLang.mlKitCode))
+    }
+
+  private fun extractSpeechSegmentsWithVad(samples: FloatArray): List<Triple<Int, Int, FloatArray>> {
+    val vad = createLiveVad()
     val list = mutableListOf<Triple<Int, Int, FloatArray>>()
     try {
-      val win = 512
       var offset = 0
-      while (offset + win <= samples.size) {
-        vad.acceptWaveform(samples.copyOfRange(offset, offset + win))
-        offset += win
-      }
+      while (offset + 512 <= samples.size) { vad.acceptWaveform(samples.copyOfRange(offset, offset + 512)); offset += 512 }
       vad.flush()
       while (!vad.empty()) {
         val seg = vad.front()
-        val startSec = seg.start / 16000
-        val endSec = (seg.start + seg.samples.size) / 16000
-        if (seg.samples.size >= 4000) {
-          list.add(Triple(startSec, maxOf(endSec, startSec + 1), seg.samples))
-        }
+        val s = seg.start / 16000; val e = (seg.start + seg.samples.size) / 16000
+        if (seg.samples.size >= 4000) list.add(Triple(s, maxOf(e, s + 1), seg.samples))
         vad.pop()
       }
-    } finally {
-      vad.release()
-    }
-
+    } finally { vad.release() }
     if (list.isEmpty()) {
-      val chunkLen = 16000 * 10
       var pos = 0
       while (pos < samples.size) {
-        val end = minOf(pos + chunkLen, samples.size)
-        list.add(Triple(pos / 16000, end / 16000, samples.copyOfRange(pos, end)))
-        pos = end
+        val end = minOf(pos + 160000, samples.size)
+        list.add(Triple(pos / 16000, end / 16000, samples.copyOfRange(pos, end))); pos = end
       }
     }
     return list
   }
 
   suspend fun processVideo(
-    videoUri: Uri,
-    sourceLang: SourceLanguage,
-    targetLang: TargetLanguage,
-    onStatus: (Float, String) -> Unit
+    videoUri: Uri, sourceLang: SourceLanguage, targetLang: TargetLanguage,
+    speechRate: Float = 1.0f, pitch: Float = 1.0f, onStatus: (Float, String) -> Unit
   ): DubbingResult = withContext(Dispatchers.IO) {
     onStatus(0.08f, "ভিডিও থেকে অডিও আলাদা করা হচ্ছে...")
     val samples = VideoAudioExtractor.extract16kMonoFloatPcm(context, videoUri)
@@ -153,284 +169,70 @@ class OfflineDubberEngine(private val context: Context) {
     onStatus(0.18f, "কথার অংশগুলো আলাদা করা হচ্ছে (VAD)...")
     val speechSegments = extractSpeechSegmentsWithVad(samples)
 
-    onStatus(0.25f, "শক্তিশালী অফলাইন AI মডেল চালু হচ্ছে...")
+    onStatus(0.25f, "অফলাইন AI মডেল চালু হচ্ছে...")
     val asr = getRecognizer(sourceLang.whisperCode)
-
     val rawChunks = mutableListOf<Triple<Int, Int, String>>()
     val total = speechSegments.size.coerceAtLeast(1)
 
     for ((idx, seg) in speechSegments.withIndex()) {
-      onStatus(
-        0.28f + 0.35f * (idx.toFloat() / total),
-        "কথা বোঝা হচ্ছে (${idx + 1}/$total)..."
-      )
+      onStatus(0.28f + 0.35f * (idx.toFloat() / total), "কথা বোঝা হচ্ছে (${idx + 1}/$total)...")
       val stream = asr.createStream()
       stream.acceptWaveform(seg.third, 16000)
       asr.decode(stream)
       val rawText = asr.getResult(stream).text.trim()
       stream.release()
-
-      val cleaned = cleanWhisperRepetitions(rawText)
-      if (cleaned.isNotBlank()) {
-        rawChunks.add(Triple(seg.first, seg.second, cleaned))
-      }
+      val cleaned = WavTtsHelper.cleanWhisperRepetitions(rawText)
+      if (cleaned.isNotBlank()) rawChunks.add(Triple(seg.first, seg.second, cleaned))
     }
-
     require(rawChunks.isNotEmpty()) { "ভিডিওতে কোনো স্পষ্ট কথা পাওয়া যায়নি।" }
 
-    onStatus(0.65f, "অফলাইন অনুবাদ প্রস্তুত করা হচ্ছে...")
-    val sourceCode = if (sourceLang.mlKitCode != null) {
-      sourceLang.mlKitCode
-    } else {
-      val sampleText = rawChunks.joinToString(" ") { it.third }.take(400)
-      val detected = LanguageIdentification.getClient().identifyLanguage(sampleText).await()
-      TranslateLanguage.fromLanguageTag(detected) ?: TranslateLanguage.ENGLISH
+    onStatus(0.65f, "অফলাইন অনুবাদ করা হচ্ছে...")
+    val sourceCode = if (sourceLang.mlKitCode != null) sourceLang.mlKitCode else {
+      val det = LanguageIdentification.getClient().identifyLanguage(rawChunks.joinToString(" ") { it.third }.take(400)).await()
+      TranslateLanguage.fromLanguageTag(det) ?: TranslateLanguage.ENGLISH
     }
 
-    val translatedChunks = mutableListOf<Triple<Int, Int, String>>()
-    if (sourceCode == targetLang.mlKitCode) {
-      translatedChunks.addAll(rawChunks)
-    } else {
-      val options = TranslatorOptions.Builder()
-        .setSourceLanguage(sourceCode)
-        .setTargetLanguage(targetLang.mlKitCode)
-        .build()
-      val translator = Translation.getClient(options)
-      try {
-        val modelManager = RemoteModelManager.getInstance()
-        val srcModel = TranslateRemoteModel.Builder(sourceCode).build()
-        val tgtModel = TranslateRemoteModel.Builder(targetLang.mlKitCode).build()
-        val srcReady = runCatching { modelManager.isModelDownloaded(srcModel).await() }.getOrDefault(false)
-        val tgtReady = runCatching { modelManager.isModelDownloaded(tgtModel).await() }.getOrDefault(false)
-
-        if (!srcReady || !tgtReady) {
-          onStatus(0.68f, "প্রথমবার অফলাইন অনুবাদ ফাইল (~৩০ MB) ডাউনলোড হচ্ছে...")
-          val downloaded = withTimeoutOrNull(90_000L) {
-            runCatching {
-              translator.downloadModelIfNeeded(DownloadConditions.Builder().build()).await()
-            }.isSuccess
-          } ?: false
-          if (!downloaded) {
-            throw IllegalStateException(
-              "এই ভাষার অফলাইন অনুবাদ প্যাক (~৩০ MB) নামাতে ইন্টারনেট/এমবি লাগবে (শুধু প্রথমবার)।"
-            )
-          }
-        }
-
-        for ((idx, chunk) in rawChunks.withIndex()) {
-          onStatus(
-            0.70f + 0.12f * (idx.toFloat() / rawChunks.size),
-            "অফলাইনে অনুবাদ হচ্ছে (${idx + 1}/${rawChunks.size})..."
-          )
-          val translated = translator.translate(chunk.third).await()
-          translatedChunks.add(Triple(chunk.first, chunk.second, translated))
-        }
-      } finally {
-        translator.close()
-      }
+    val cues = mutableListOf<SubtitleCue>()
+    for ((idx, chunk) in rawChunks.withIndex()) {
+      onStatus(0.68f + 0.14f * (idx.toFloat() / rawChunks.size), "অফলাইনে অনুবাদ হচ্ছে (${idx + 1}/${rawChunks.size})...")
+      val translated = ensureModelsAndTranslate(chunk.third, sourceCode, targetLang.mlKitCode)
+      cues.add(SubtitleCue(chunk.first * 1000, maxOf(chunk.second * 1000, chunk.first * 1000 + 1200), chunk.third, translated))
     }
 
-    onStatus(0.84f, "অফলাইন ভয়েস তৈরি করা হচ্ছে...")
-    val partWavFiles = mutableListOf<File>()
-    val transcriptBuilder = StringBuilder()
-    transcriptBuilder.append("মূল ভাষা: $sourceCode -> অনুবাদ: ${targetLang.label}\n")
+    onStatus(0.85f, "প্রো অফলাইন ভয়েস তৈরি হচ্ছে...")
+    val outFile = File(context.filesDir, "dubbed_${System.currentTimeMillis()}.wav")
+    val header = synthesizeCues(cues, "মূল ভাষা: $sourceCode -> অনুবাদ: ${targetLang.label}", targetLang, speechRate, pitch, outFile)
+    onStatus(1.0f, "সম্পন্ন!")
+    DubbingResult(outFile, cues, header)
+  }
 
-    val (tts, hasOfflineVoice) = createTts(targetLang.locale)
-    if (!hasOfflineVoice) {
-      transcriptBuilder.append("নোট: ফোনে অফলাইন ভয়েস না থাকায় অনলাইন ভয়েস ব্যবহৃত হচ্ছে। Settings > Text-to-speech থেকে নামিয়ে নিন।\n")
-    }
-    transcriptBuilder.append("----------------------------------------\n")
+  suspend fun reSynthesizeFromCues(
+    cues: List<SubtitleCue>, headerInfo: String, targetLang: TargetLanguage, speechRate: Float, pitch: Float
+  ): DubbingResult = withContext(Dispatchers.IO) {
+    val outFile = File(context.filesDir, "dubbed_${System.currentTimeMillis()}.wav")
+    val header = synthesizeCues(cues, headerInfo, targetLang, speechRate, pitch, outFile)
+    DubbingResult(outFile, cues, header)
+  }
 
+  private suspend fun synthesizeCues(
+    cues: List<SubtitleCue>, baseHeader: String, targetLang: TargetLanguage, speechRate: Float, pitch: Float, outFile: File
+  ): String {
+    val partFiles = mutableListOf<File>()
+    val (tts, hasOffline) = WavTtsHelper.createTts(context, targetLang.locale, false, speechRate, pitch)
     try {
-      for ((idx, chunk) in translatedChunks.withIndex()) {
-        val orig = rawChunks[idx].third
-        val trans = chunk.third
-        transcriptBuilder.append("[${chunk.first}s - ${chunk.second}s]\n")
-        transcriptBuilder.append("মূল: $orig\nঅনুবাদ: $trans\n\n")
-
+      for ((idx, cue) in cues.withIndex()) {
         val partFile = File(context.cacheDir, "tts_part_$idx.wav")
         if (partFile.exists()) partFile.delete()
-        withTimeoutOrNull(20_000L) {
-          synthesizeToWav(tts, trans, partFile, "utt_$idx", hasOfflineVoice)
-        }
-        if (partFile.exists() && partFile.length() > 44) {
-          partWavFiles.add(partFile)
-        }
+        withTimeoutOrNull(20_000L) { WavTtsHelper.synthesizeToWav(tts, cue.trans, partFile, "utt_$idx", hasOffline) }
+        if (partFile.exists() && partFile.length() > 44) partFiles.add(partFile)
       }
-    } finally {
-      tts.stop()
-      tts.shutdown()
-    }
-
-    require(partWavFiles.isNotEmpty()) {
-      "ফোনে ${targetLang.label} অফলাইন ভয়েস ডাউনলোড করা নেই বা ইন্টারনেট বন্ধ! Settings > Text-to-speech > Install voice data থেকে ভয়েস নামিয়ে নিন।"
-    }
-
-    val finalWav = File(context.filesDir, "dubbed_output.wav")
-    mergeWavFiles(partWavFiles, finalWav)
-    partWavFiles.forEach { it.delete() }
-
-    onStatus(1.0f, "সম্পন্ন!")
-    DubbingResult(finalWav, transcriptBuilder.toString())
+    } finally { tts.stop(); tts.shutdown() }
+    require(partFiles.isNotEmpty()) { "ফোনে ${targetLang.label} অফলাইন ভয়েস ডাউনলোড করা নেই। প্রো সেটিংস থেকে ভয়েস নামিয়ে নিন।" }
+    WavTtsHelper.mergeWavFiles(partFiles, outFile)
+    partFiles.forEach { it.delete() }
+    return if (hasOffline) baseHeader else "$baseHeader\n(নোট: Settings > Text-to-speech থেকে অফলাইন ভয়েস নামিয়ে নিন)"
   }
 
-  private fun cleanWhisperRepetitions(input: String): String {
-    val words = input.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
-    if (words.size <= 4) return words.joinToString(" ")
-
-    val out = mutableListOf<String>()
-    var i = 0
-    while (i < words.size) {
-      var skipped = false
-      for (n in 1..6) {
-        if (i + n * 3 <= words.size) {
-          val phrase = words.subList(i, i + n)
-          var repeats = 1
-          var j = i + n
-          while (j + n <= words.size && words.subList(j, j + n) == phrase) {
-            repeats++
-            j += n
-          }
-          if (repeats >= 3) {
-            out.addAll(phrase)
-            i = j
-            skipped = true
-            break
-          }
-        }
-      }
-      if (!skipped) {
-        out.add(words[i])
-        i++
-      }
-    }
-    return out.joinToString(" ")
-  }
-
-  private suspend fun createTts(locale: Locale): Pair<TextToSpeech, Boolean> =
-    suspendCancellableCoroutine { cont ->
-      var ttsRef: TextToSpeech? = null
-      ttsRef = TextToSpeech(context) { status ->
-        val engine = ttsRef
-        if (status == TextToSpeech.SUCCESS && engine != null) {
-          val voices = runCatching { engine.voices }.getOrNull().orEmpty()
-          val offlineExact = voices.firstOrNull {
-            !it.isNetworkConnectionRequired &&
-              it.locale.language == locale.language &&
-              it.locale.country == locale.country
-          }
-          val offlineLang = voices.firstOrNull {
-            !it.isNetworkConnectionRequired &&
-              it.locale.language == locale.language
-          }
-          val useOffline = (offlineExact != null || offlineLang != null)
-          if (offlineExact != null) {
-            engine.voice = offlineExact
-          } else if (offlineLang != null) {
-            engine.voice = offlineLang
-          } else {
-            engine.language = locale
-          }
-          cont.resume(Pair(engine, useOffline))
-        } else {
-          cont.resumeWithException(IllegalStateException("ফোনের Text-to-Speech চালু করা যায়নি।"))
-        }
-      }
-    }
-
-  private suspend fun synthesizeToWav(
-    tts: TextToSpeech,
-    text: String,
-    outFile: File,
-    utteranceId: String,
-    useEmbeddedOnly: Boolean
-  ) = suspendCancellableCoroutine { cont ->
-    tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-      override fun onStart(id: String?) {}
-      override fun onDone(id: String?) {
-        if (id == utteranceId && cont.isActive) cont.resume(Unit)
-      }
-      @Deprecated("Deprecated in Java")
-      override fun onError(id: String?) {
-        if (id == utteranceId && cont.isActive) cont.resume(Unit)
-      }
-      override fun onError(id: String?, errorCode: Int) {
-        if (id == utteranceId && cont.isActive) cont.resume(Unit)
-      }
-    })
-    val params = Bundle().apply {
-      if (useEmbeddedOnly) {
-        putString(TextToSpeech.Engine.KEY_FEATURE_EMBEDDED_SYNTHESIS, "true")
-        putString(TextToSpeech.Engine.KEY_FEATURE_NETWORK_SYNTHESIS, "false")
-      }
-    }
-    val res = tts.synthesizeToFile(text, params, outFile, utteranceId)
-    if (res != TextToSpeech.SUCCESS && cont.isActive) {
-      cont.resume(Unit)
-    }
-  }
-
-  private fun mergeWavFiles(inputs: List<File>, output: File) {
-    if (inputs.isEmpty()) {
-      output.writeBytes(ByteArray(0))
-      return
-    }
-    var sampleRate = 22050
-    var channels = 1
-    var bitsPerSample = 16
-    val pcmStream = ByteArrayOutputStream()
-
-    inputs.forEachIndexed { index, file ->
-      val bytes = file.readBytes()
-      var pos = 12
-      while (pos + 8 <= bytes.size) {
-        val id = String(bytes, pos, 4, Charsets.US_ASCII)
-        val size = ByteBuffer.wrap(bytes, pos + 4, 4).order(ByteOrder.LITTLE_ENDIAN).int
-        val dataStart = pos + 8
-        if (id == "fmt " && dataStart + 16 <= bytes.size && index == 0) {
-          val fmtBuf = ByteBuffer.wrap(bytes, dataStart, 16).order(ByteOrder.LITTLE_ENDIAN)
-          fmtBuf.short
-          channels = fmtBuf.short.toInt()
-          sampleRate = fmtBuf.int
-          fmtBuf.int
-          fmtBuf.short
-          bitsPerSample = fmtBuf.short.toInt()
-        } else if (id == "data" && size > 0 && dataStart + size <= bytes.size) {
-          pcmStream.write(bytes, dataStart, size)
-        }
-        pos = dataStart + size + (size and 1)
-      }
-    }
-
-    val pcmData = pcmStream.toByteArray()
-    val byteRate = sampleRate * channels * (bitsPerSample / 8)
-    val blockAlign = (channels * (bitsPerSample / 8)).toShort()
-
-    val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN).apply {
-      put("RIFF".toByteArray(Charsets.US_ASCII))
-      putInt(36 + pcmData.size)
-      put("WAVE".toByteArray(Charsets.US_ASCII))
-      put("fmt ".toByteArray(Charsets.US_ASCII))
-      putInt(16)
-      putShort(1)
-      putShort(channels.toShort())
-      putInt(sampleRate)
-      putInt(byteRate)
-      putShort(blockAlign)
-      putShort(bitsPerSample.toShort())
-      put("data".toByteArray(Charsets.US_ASCII))
-      putInt(pcmData.size)
-    }.array()
-
-    FileOutputStream(output).use { fos ->
-      fos.write(header)
-      fos.write(pcmData)
-    }
-  }
-
-  fun release() {
-    recognizer?.release()
-    recognizer = null
-  }
+  fun release() { liveTranslator?.close(); liveTranslator = null; recognizer?.release(); recognizer = null }
 }
 EOF
